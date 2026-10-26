@@ -30,7 +30,7 @@ foreach ($rp in $runPaths) {
 }
 
 # Stop processes that trigger the IGCL ctlEnumerateDevices kernel deadlock on Code 43
-Get-Process -Name "IntelGraphicsSoftware.Overlay", "PresentMonService", "igfxShaderDistributionService", "esrv_svc", "SurSvc", "collector_service", "telemetry_agent", "DSAService", "DSAUpdateService", "DSATray" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process -Name "IntelGraphicsSoftware.Overlay", "PresentMonService", "igfxShaderDistributionService", "esrv_svc", "SurSvc", "collector_service", "telemetry_agent" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 
 $igsDir = "C:\Program Files\Intel\Intel Graphics Software"
 if (Test-Path $igsDir) {
@@ -52,7 +52,7 @@ if (Test-Path $pmSharedDir) {
     }
 }
 
-# Disable conflictive auxiliary & telemetry services
+# Disable conflictive auxiliary & telemetry services (while keeping DSAService enabled for normal driver updates)
 $toxicServices = @(
     "PresentMonSharedService",
     "IGSDSserviceDiscrete",
@@ -63,15 +63,22 @@ $toxicServices = @(
     "SystemUsageReportSvc_QUEENCREEK",
     "Intel(R) SUR QC SAM",
     "IntelCollectorService",
-    "IntelTelemetryAgent",
-    "DSAService",
-    "DSAUpdateService"
+    "IntelTelemetryAgent"
 )
 foreach ($svc in $toxicServices) {
     if (Get-Service -Name $svc -ErrorAction SilentlyContinue) {
         Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
         Set-Service -Name $svc -StartupType Disabled -ErrorAction SilentlyContinue
         reg.exe add "HKLM\SYSTEM\CurrentControlSet\Services\$svc" /v Start /t REG_DWORD /d 4 /f | Out-Null
+    }
+}
+
+# Keep DSAService & DSAUpdateService enabled (Delayed Auto-Start) so built-in driver updates in Intel Graphics Software work normally
+foreach ($dsaSvc in @("DSAService", "DSAUpdateService")) {
+    if (Get-Service -Name $dsaSvc -ErrorAction SilentlyContinue) {
+        reg.exe add "HKLM\SYSTEM\CurrentControlSet\Services\$dsaSvc" /v Start /t REG_DWORD /d 2 /f | Out-Null
+        reg.exe add "HKLM\SYSTEM\CurrentControlSet\Services\$dsaSvc" /v DelayedAutoStart /t REG_DWORD /d 1 /f | Out-Null
+        Start-Service -Name $dsaSvc -ErrorAction SilentlyContinue
     }
 }
 

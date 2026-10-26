@@ -83,10 +83,11 @@ Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Silent
 $Action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$DestGuard`""
 $TriggerBoot = New-ScheduledTaskTrigger -AtStartup
 $TriggerLogon = New-ScheduledTaskTrigger -AtLogOn
+$TriggerPeriodic = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 15)
 $Principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
 $Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
 
-Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger @($TriggerBoot, $TriggerLogon) -Principal $Principal -Settings $Settings -Description "Prevents Code 43 / Event 1011 and post-login kernel deadlocks on Intel Arc GPUs" -Force | Out-Null
+Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger @($TriggerBoot, $TriggerLogon, $TriggerPeriodic) -Principal $Principal -Settings $Settings -Description "Prevents Code 43 / Event 1011 and post-login kernel deadlocks on Intel Arc GPUs" -Force | Out-Null
 Log-Step "  -> Registered Scheduled Task '$TaskName' as SYSTEM (AtStartup + AtLogOn)."
 
 # ------------------------------------------------------------------------------
