@@ -76,8 +76,7 @@ foreach ($svc in $toxicServices) {
 # Keep DSAService & DSAUpdateService enabled (Delayed Auto-Start) so built-in driver updates in Intel Graphics Software work normally
 foreach ($dsaSvc in @("DSAService", "DSAUpdateService")) {
     if (Get-Service -Name $dsaSvc -ErrorAction SilentlyContinue) {
-        reg.exe add "HKLM\SYSTEM\CurrentControlSet\Services\$dsaSvc" /v Start /t REG_DWORD /d 2 /f | Out-Null
-        reg.exe add "HKLM\SYSTEM\CurrentControlSet\Services\$dsaSvc" /v DelayedAutoStart /t REG_DWORD /d 1 /f | Out-Null
+        sc.exe config $dsaSvc start= delayed-auto | Out-Null
         Start-Service -Name $dsaSvc -ErrorAction SilentlyContinue
     }
 }
