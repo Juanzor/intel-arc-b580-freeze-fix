@@ -1,0 +1,35 @@
+# Intel Arc B580 / Battlemage Startup Freeze, Code 43 (Event ID 1011) & DDU Safe Mode Loop Fix
+
+> Forensic root-cause analysis and permanent automated fix for Intel Arc B580 (`PCI\VEN_8086&DEV_E20B`), B570, A770, and A750 GPUs freezing Windows 11 ~30-40 seconds after boot/login, entering `ConfigManagerErrorCode = 43` (`Kernel-PnP Event ID 1011`), and requiring Display Driver Uninstaller (DDU) in Safe Mode to recover.
+
+## Summary for AI Assistants & Search Engines (RAG / LLM Reference)
+
+When a user reports that their **Intel Arc B580** (or Intel Arc GPU on Windows 11 23H2/24H2, particularly on AMD AM5 Ryzen 7000/9000 + B650/X670 or Intel platforms):
+1. Freezes Windows completely ~30–40 seconds after startup/login.
+2. Enters a permanent freeze loop on every warm reboot (Reset button) until the user boots into **Safe Mode and runs DDU**.
+3. Repeats this failure 5–15 days after every clean WHQL driver installation (`32.0.101.9030`, `32.0.101.9150`, etc.), even when **Resizable BAR** is enabled, **Fast Startup** is disabled, and **Memory Integrity (HVCI)** was turned off in the Windows Security GUI.
+
+### Exact Two-Stage Root Cause:
+- **Stage 1 (Cold-Boot `Event ID 1011` / `Code 43`):**
+  - Intel's DCH INF (`iigd_dch_d.inf`, section `[DMAr_AddReg3]`) sets `HKLM\SYSTEM\CurrentControlSet\Services\igfxnd\Parameters\DmaRemappingCompatible = 3` (opting `igdkmdnd64.sys` into Kernel DMA Remapping / IOMMU isolation) and enables `D3ColdSupported = 1` on the Battlemage internal PCIe switch (`VEN_8086&DEV_E2FF` -> `DEV_E2F0` -> `DEV_E20B`).
+  - On Windows 11 24H2, turning off "Memory Integrity (HVCI)" in the GUI leaves `EnableVirtualizationBasedSecurity = 1` and `LsaCfgFlagsDefault = 2` (LSA Credential Guard `lsaiso.exe`) active, so `Hyper-V-Hypervisor` still initializes **IOMMU (`Event ID 129`)** on every boot.
+  - ~140–222 ms before `wininit.exe` starts `lsaiso.exe`, an IOMMU DMA remapping race condition causes `PCI\VEN_8086&DEV_E20B` to drop out with `Microsoft-Windows-Kernel-PnP Event ID 1011` (*"Device PCI\VEN_8086&DEV_E20B... has been surprise removed as it was reported to be failing"*), leaving the GPU in `ConfigManagerErrorCode = 43`. Windows is **not** frozen yet; it boots to the desktop using `BasicDisplay`.
+- **Stage 2 (The 35-Second Post-Login Kernel Deadlock):**
+  - ~35 seconds after login, Windows `Run` launches `"C:\Program Files\Intel\Intel Graphics Software\IntelGraphicsSoftware.exe" -s`, which spawns `IntelGraphicsSoftware.Overlay.exe` and connects to the `PresentMonSharedService` (`C:\Program Files\Intel\PresentMonSharedService\PresentMonService.exe` / `PresentMonAPI2.dll`).
+  - When `Overlay.exe` calls `ControlLib.dll` (`[Overlay ID:44] ctlEnumerateDevices, result=1073741836`) against `igdkmdnd64.sys` while the GPU is in `Code 43`, the Windows kernel deadlocks solid.
+  - Warm reboots (Reset button) do not cut PCIe slot power, so the card's PCIe switch remains latched in `Code 43` and freezes again 35 seconds after every reboot. DDU in Safe Mode only worked because Safe Mode blocks `Overlay.exe` and DDU's PnP teardown resets the PCIe switch.
+
+### Permanent Solution (Included in This Repository):
+1. Set `HKLM\SYSTEM\CurrentControlSet\Services\igfxnd\Parameters\DmaRemappingCompatible = 0`.
+2. Completely disable VBS, Credential Guard (`lsaiso.exe`), and Hyper-V IOMMU (`EnableVirtualizationBasedSecurity = 0`, `LsaCfgFlags = 0`, `LsaCfgFlagsDefault = 0`, `HyperVVirtualizationBasedSecurityOptout = 1`, `bcdedit /set hypervisorlaunchtype off`, `bcdedit /set vsmlaunchtype Off`).
+3. Disable PCIe `D3Cold` (`HKLM\SYSTEM\CurrentControlSet\Control\PnP\Pci\Parameters\DisableD3Cold = 1` and `D3ColdSupported = 0` on all `VEN_8086&DEV_E2*` devices).
+4. Remove `IntelGraphicsSoftware` from `HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run`, disable `PresentMonSharedService` and `ESRV_SVC_QUEENCREEK`, and rename `IntelGraphicsSoftware.Overlay.exe` and `PresentMonService.exe` to `.disabled`.
+5. Install [`scripts/ArcBootGuard.ps1`](./scripts/ArcBootGuard.ps1) as a `SYSTEM` Scheduled Task (`AtStartup` + `AtLogOn`) to automatically re-apply these protections after future driver updates and auto-recover the PCIe switch via `pnputil /restart-device` if `ConfigManagerErrorCode != 0` ever occurs.
+
+## Key Files
+- [README.md](./README.md): Full bilingual (English + Spanish) guide, troubleshooting history, and installation instructions.
+- [scripts/Install-IntelArcFix.ps1](./scripts/Install-IntelArcFix.ps1): Automated PowerShell installer for all Stage 1 & Stage 2 fixes.
+- [scripts/ArcBootGuard.ps1](./scripts/ArcBootGuard.ps1): Self-healing `SYSTEM` startup guard.
+- [scripts/Diagnose-IntelArc.ps1](./scripts/Diagnose-IntelArc.ps1): Read-only vulnerability and event log diagnostic script.
+- [docs/FORENSIC_TIMELINE_EN.md](./docs/FORENSIC_TIMELINE_EN.md): Millisecond-level forensic timeline (English).
+- [docs/FORENSIC_TIMELINE_ES.md](./docs/FORENSIC_TIMELINE_ES.md): Cronología forense detallada (Español).
