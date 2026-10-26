@@ -34,11 +34,15 @@ Needs = PciD3ColdSupported.Hw
 
 En los tres incidentes registrados, el canal `Microsoft-Windows-Kernel-PnP/Device Management` registró el **`Event ID 1011`** (`Device PCI\VEN_8086&DEV_E20B... has been surprise removed as it was reported to be failing`) exactamente **entre 138 y 222 milisegundos** antes de que `Microsoft-Windows-Wininit` inicializara VBS / Credential Guard (`lsaiso.exe`):
 
-| Fecha del Incidente | `Kernel-PnP` Event 1011 (`DEV_E20B` Surprise Removed) | `Wininit` Event 13 (`lsaiso.exe` Credential Guard) e `Hyper-V` Event 129 (`IOMMU`) | Diferencia |
+| Fecha del Incidente | `Kernel-PnP` Event 1011 (`DEV_E20B` Surprise Removed) | ID de Instancia PnP (Cambia Tras Cada DDU) | `Wininit` Event 13 (`lsaiso.exe`) e `Hyper-V` Event 129 (`IOMMU`) |
 | :--- | :--- | :--- | :--- |
-| **05/10/2026** | `11:41:20.129` | `11:41:20.267` | **+138 ms** |
-| **11/10/2026** | `14:20:11.677` | `14:20:11.883` | **+206 ms** |
-| **26/10/2026** | `10:59:06.879` | `10:59:07.101` | **+222 ms** |
+| **19/08/2026** | `19:01:18.652` | `6&81e8c03&0&00080009` | Desconexión por sorpresa en arranque |
+| **26/08/2026** | `18:13:12.697` (`+3` reinicios a las `18:34`, `18:45`, `18:53`) | `6&81e8c03&0&00080009` | 4 congelamientos seguidos hasta pasar DDU |
+| **12/09/2026** | `17:36:34.397` | `6&1bb74b5d&0&00080009` | Desconexión por sorpresa en arranque |
+| **19/09/2026** | `17:07:05.878` | `6&1bb74b5d&0&00080009` | Desconexión por sorpresa en arranque |
+| **05/10/2026** | `11:41:20.129` | `6&1ddf9734&0&00080009` | `11:41:20.267` (**+138 ms**) |
+| **11/10/2026** | `14:20:11.677` | `6&1ddf9734&0&00080009` | `14:20:11.883` (**+206 ms**) |
+| **26/10/2026** | `10:59:06.879` | `6&a46d7da&0&00080009` | `10:59:07.101` (**+222 ms**) |
 
 ### Por qué apagar "Integridad de memoria (HVCI)" desde la interfaz de Windows NO detuvo la Fase 1
 El `11/10/2026` se desactivó `HypervisorEnforcedCodeIntegrity\Enabled = 0`. Sin embargo, en Windows 11 24H2:

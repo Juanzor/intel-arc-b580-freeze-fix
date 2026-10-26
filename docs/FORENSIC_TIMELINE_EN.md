@@ -34,11 +34,15 @@ Needs = PciD3ColdSupported.Hw
 
 Across all three freeze incidents, `Microsoft-Windows-Kernel-PnP/Device Management` logged **`Event ID 1011`** (`Device PCI\VEN_8086&DEV_E20B... has been surprise removed as it was reported to be failing`) **~138 to 222 ms** before `Microsoft-Windows-Wininit` initialized VBS / Credential Guard (`lsaiso.exe`):
 
-| Incident Date | `Kernel-PnP` Event 1011 (`DEV_E20B` Surprise Removed) | `Wininit` Event 13 (`lsaiso.exe` Credential Guard) & `Hyper-V` Event 129 (`IOMMU`) | Delta |
+| Incident Date | `Kernel-PnP` Event 1011 (`DEV_E20B` Surprise Removed) | PnP Instance ID (Changes After Every DDU Run) | `Wininit` Event 13 (`lsaiso.exe`) & `Hyper-V` Event 129 (`IOMMU`) |
 | :--- | :--- | :--- | :--- |
-| **2026-10-05** | `11:41:20.129` | `11:41:20.267` | **+138 ms** |
-| **2026-10-11** | `14:20:11.677` | `14:20:11.883` | **+206 ms** |
-| **2026-10-26** | `10:59:06.879` | `10:59:07.101` | **+222 ms** |
+| **2026-08-19** | `19:01:18.652` | `6&81e8c03&0&00080009` | Cold boot surprise removal |
+| **2026-08-26** | `18:13:12.697` (`+3` warm reboots at `18:34`, `18:45`, `18:53`) | `6&81e8c03&0&00080009` | 4 consecutive freezes until DDU in Safe Mode |
+| **2026-09-12** | `17:36:34.397` | `6&1bb74b5d&0&00080009` | Cold boot surprise removal |
+| **2026-09-19** | `17:07:05.878` | `6&1bb74b5d&0&00080009` | Cold boot surprise removal |
+| **2026-10-05** | `11:41:20.129` | `6&1ddf9734&0&00080009` | `11:41:20.267` (**+138 ms**) |
+| **2026-10-11** | `14:20:11.677` | `6&1ddf9734&0&00080009` | `14:20:11.883` (**+206 ms**) |
+| **2026-10-26** | `10:59:06.879` | `6&a46d7da&0&00080009` | `10:59:07.101` (**+222 ms**) |
 
 ### Why Disabling "Memory Integrity (HVCI)" in the Windows GUI Did Not Stop Stage 1
 On `2026-10-11`, `HypervisorEnforcedCodeIntegrity\Enabled` was set to `0`. However, on Windows 11 24H2:
