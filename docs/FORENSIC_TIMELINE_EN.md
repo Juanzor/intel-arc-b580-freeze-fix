@@ -1,91 +1,85 @@
-# Forensic Timeline: Intel Arc B580 Startup Freeze (`Event ID 1011` + `Overlay.exe` Deadlock)
+# Forensic Timeline: Intel Arc B580 Startup Freeze (`Event ID 1011` + `PresentMonAPI2.dll` / `dxgkrnl.sys` Deadlock) — v2.0
 
-This document records the exact, millisecond-level Windows Event Log and WMI telemetry captured across three separate freeze events (`2026-10-05`, `2026-10-11`, and `2026-10-26`) on an **AMD Ryzen 5 7600 + ASRock B650M-H/M.2+ (BIOS 4.43) + Intel Arc B580 (12 GB, Driver `32.0.101.9030` & `32.0.101.9150`)** running **Windows 11 24H2 (Build 26100)**.
+This document records the exact, millisecond-level Windows Event Log, Kernel Watchdog (`WATCHDOG-*.dmp`), and INF registry telemetry captured across four separate freeze incidents (`2026-10-05`, `2026-10-11`, `2026-10-26`, and `2026-11-01`) on an **AMD Ryzen 5 7600 + ASRock B650M-H/M.2+ (BIOS 4.43) + Intel Arc B580 (12 GB, Driver `32.0.101.9030` & `32.0.101.9150`) + MOTU USB Audio Interface (`MOTUCoreUAC`)** running **Windows 11 24H2 (Build 26100)**.
 
 ---
 
 ## 1. The Hardware PCIe Topology of the Intel Arc B580 (Battlemage)
 
-Unlike simple single-endpoint PCIe devices, the Intel Arc B580 uses an internal PCIe Switch hierarchy:
-1. **PCIe Upstream Switch Port:** `PCI\VEN_8086&DEV_E2FF`
-2. **PCIe Downstream Switch Port (Display):** `PCI\VEN_8086&DEV_E2F0`
-   - **Display Controller (GPU):** `PCI\VEN_8086&DEV_E20B&SUBSYS_18771025&REV_00` (`igfxnd` / `igdkmdnd64.sys`)
-3. **PCIe Downstream Switch Port (Audio):** `PCI\VEN_8086&DEV_E2F1`
-   - **HD Audio Controller:** `PCI\VEN_8086&DEV_E2F7`
-
-### What Intel's INF (`iigd_dch_d.inf`) Configures by Default
-In section `[BMG_W11_IAG_E20B_FWU.Services]` and `[BMG_W11_IAG_E20B_FWU.HW]`:
-```ini
-[BMG_W11_IAG_E20B_FWU.Services]
-AddService = igfxnd, 0x00000002, igfx_Service_Inst, igfx_EventLog_Inst
-AddReg = DMAr_AddReg3
-
-[DMAr_AddReg3]
-; Opts igdkmdnd64.sys into Kernel DMA Remapping (IOMMU page table isolation)
-HKR,Parameters,DmaRemappingCompatible,0x00010001,3
-
-[BMG_W11_IAG_E20B_FWU.HW]
-Needs = PciD3ColdSupported.Hw
-```
+Unlike single-endpoint PCIe devices, the Intel Arc B580 uses an internal PCIe Switch hierarchy connected behind the CPU's PCIe Root Port (`PCI\VEN_1022&DEV_14DB`):
+1. **PCIe Upstream Switch Port:** `PCI\VEN_8086&DEV_E2FF` (`memcntrl.inf`)
+2. **PCIe Downstream Switch Port (Display):** `PCI\VEN_8086&DEV_E2F0` (`memcntrl.inf`)
+   - **Display Controller (GPU):** `PCI\VEN_8086&DEV_E20B&SUBSYS_18771025&REV_00` (`iigd_dch_d.inf` $\rightarrow$ `igfxnd` / `igdkmdnd64.sys`)
+     - Child PnP Node: `VIDEO\INTC_HECI_2` (`gscheci.inf` $\rightarrow$ `GSCx64` / `TeeDriverGSCW8x64.sys`)
+     - Child PnP Node: `VIDEO\INTC_PMT` (`PmtChildDriver.inf`)
+3. **PCIe Downstream Switch Port (Audio):** `PCI\VEN_8086&DEV_E2F1` (`memcntrl.inf`)
+   - **HD Audio Controller:** `PCI\VEN_8086&DEV_E2F7` (`hdaudbus.inf` + `HdBusExt.inf` *"Intel(R) HD Graphics D3COLD"*)
 
 ---
 
-## 2. Millisecond Correlation of Stage 1 (`Event ID 1011` Surprise Removal)
+## 2. What Intel's INF Files Actually Write on Windows 11 24H2 (`wNext`)
 
-Across all three freeze incidents, `Microsoft-Windows-Kernel-PnP/Device Management` logged **`Event ID 1011`** (`Device PCI\VEN_8086&DEV_E20B... has been surprise removed as it was reported to be failing`) **~138 to 222 ms** before `Microsoft-Windows-Wininit` initialized VBS / Credential Guard (`lsaiso.exe`):
+Inspecting `iigd_dch_d.inf`, `memcntrl.inf`, `HdBusExt.inf`, and `C:\Windows\INF\pci.inf` revealed **three critical traps** that standard registry tweaks miss:
 
-| Incident Date | `Kernel-PnP` Event 1011 (`DEV_E20B` Surprise Removed) | PnP Instance ID (Changes After Every DDU Run) | `Wininit` Event 13 (`lsaiso.exe`) & `Hyper-V` Event 129 (`IOMMU`) |
-| :--- | :--- | :--- | :--- |
-| **2026-08-19** | `19:01:18.652` | `6&81e8c03&0&00080009` | Cold boot surprise removal |
-| **2026-08-26** | `18:13:12.697` (`+3` warm reboots at `18:34`, `18:45`, `18:53`) | `6&81e8c03&0&00080009` | 4 consecutive freezes until DDU in Safe Mode |
-| **2026-09-12** | `17:36:34.397` | `6&1bb74b5d&0&00080009` | Cold boot surprise removal |
-| **2026-09-19** | `17:07:05.878` | `6&1bb74b5d&0&00080009` | Cold boot surprise removal |
-| **2026-10-05** | `11:41:20.129` | `6&1ddf9734&0&00080009` | `11:41:20.267` (**+138 ms**) |
-| **2026-10-11** | `14:20:11.677` | `6&1ddf9734&0&00080009` | `14:20:11.883` (**+206 ms**) |
-| **2026-10-26** | `10:59:06.879` | `6&a46d7da&0&00080009` | `10:59:07.101` (**+222 ms**) |
-
-### Why Disabling "Memory Integrity (HVCI)" in the Windows GUI Did Not Stop Stage 1
-On `2026-10-11`, `HypervisorEnforcedCodeIntegrity\Enabled` was set to `0`. However, on Windows 11 24H2:
-- `HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\EnableVirtualizationBasedSecurity` remained `1`.
-- `HKLM\SYSTEM\CurrentControlSet\Control\Lsa\LsaCfgFlagsDefault` remained `2` (Credential Guard enabled by default).
-- Consequently, on `2026-10-26 10:59:05`, the kernel still logged:
-  - `Hyper-V-Hypervisor Event ID 129`: *"Hypervisor initialized I/O remapping (IOMMU)."*
-  - `DeviceGuard Event ID 153`: *"Virtualization-based security (policies: VBS Enabled, VSM Required) is enabled."*
-  - `Wininit Event ID 13`: *"Credential Guard (lsaiso.exe) was started and is protecting LSA credentials."*
-
----
-
-## 3. Millisecond Correlation of Stage 2 (The 35-Second Post-Login Kernel Deadlock)
-
-When `Event ID 1011` occurs at `10:59:06.879`, **Windows is NOT frozen**.
-A WMI hardware snapshot captured at `11:01:46.203` (`Devices.xml.bak`) proves the exact device state during the post-boot window:
-```xml
-<Device>
-  <Title>Intel(R) Arc(TM) B580 Graphics</Title>
-  <DeviceID>PCI\VEN_8086&amp;DEV_E20B&amp;SUBSYS_18771025&amp;REV_00\6&amp;951E780&amp;0&amp;00080009</DeviceID>
-  <DriverVersion>32.0.101.9150</DriverVersion>
-  <ConfigManagerErrorCode>43</ConfigManagerErrorCode>
-  <Availability>8</Availability>
-</Device>
-```
-
-Here is the exact sequence from `Intel-IGS-Logs/Service`, `Intel-IGS-Logs/App`, and `Intel-IGS-Logs/Overlay` showing what freezes the PC ~35 seconds after boot:
-
-### Boot 1 (`2026-10-26 10:59 AM` — Cold Boot where `Event ID 1011` occurred)
-- **`10:59:06.879`:** `Kernel-PnP Event ID 1011` puts `DEV_E20B` into `ConfigManagerErrorCode = 43`.
-- **`10:59:06.921`:** `IntelGraphicsSoftware.Service.exe` starts, calls `ctlEnumerateDevices`, receives `result=1073741825` (`0x40000001` — No display adapter found), and sleeps.
-- **`10:59:08.500`:** User logs into Windows desktop (running on `BasicDisplay`). PC works normally for 32 seconds.
-- **`10:59:40.068`:** Windows `Run` (`HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run\IntelGraphicsSoftware`) executes `"C:\Program Files\Intel\Intel Graphics Software\IntelGraphicsSoftware.exe" -s`.
-- **`10:59:40.295`:** `IntelGraphicsSoftware.exe` spawns `IntelGraphicsSoftware.Overlay.exe`.
-- **`10:59:41.787`:** `Overlay.exe` loads `PresentMonAPI2.dll` (connecting to `PresentMonSharedService` / `PresentMonService.exe`).
-- **`10:59:41.805`:** `Overlay.exe` logs its final line before the kernel freezes solid:
-  ```text
-  [Overlay ID:44] ctlEnumerateDevices, result=1073741836
+### Trap A: Windows 11 24H2 (`[BMG_IAG_E20B_FWU_WNEXT.HW]`) Uses Per-Device `[DMAr_AddReg1]` Instead of Service `[DMAr_AddReg3]`
+In `iigd_dch_d.inf`:
+- On Windows 10 and Windows 11 22H2/23H2 (`[BMG_W11_IAG_E20B_FWU.Services]`), Intel uses `[DMAr_AddReg3]`:
+  ```ini
+  [DMAr_AddReg3]
+  HKR, Parameters, DmaRemappingCompatible, %REG_DWORD%, 3
   ```
-  **At `10:59:41.805`, all disk I/O and event logging halt abruptly. The PC is frozen solid.**
+- On **Windows 11 24H2 Build 26100+ (`[BMG_IAG_E20B_FWU_WNEXT.HW]`, lines 2609–2625)**, Intel switched to **`[DMAr_AddReg1]`** (lines 4246–4250):
+  ```ini
+  [BMG_IAG_E20B_FWU_WNEXT.HW]
+  Include = pci.inf
+  Needs = PciD3ColdSupported.Hw
+  AddReg = DMAr_AddReg1
 
-### Boot 2 (`2026-10-26 11:01 AM` — Warm Reboot after pressing the physical Reset button)
-- **`11:01:23.000`:** System boots after Reset button (`Kernel-Power Event ID 41`). Because a warm reset does not remove ATX/PCIe slot power, the Battlemage PCIe switch (`DEV_E2FF` / `DEV_E2F0` / `DEV_E20B`) wakes up **still latched in `ConfigManagerErrorCode = 43`** (confirmed in `Devices.xml.bak` at `11:01:46.203`).
-- **`11:01:50.112`:** Windows `Run` launches `IntelGraphicsSoftware.exe -s` $\rightarrow$ spawns `IntelGraphicsSoftware.Overlay.exe`.
-- **`11:01:51.784`:** `Overlay.exe` loads `PresentMonAPI2.dll` and calls `[Overlay ID:44] ctlEnumerateDevices, result=1073741836`.
-- **At `11:01:51.784`, the PC freezes solid a second time.**
+  [DMAr_AddReg1]
+  HKR,"DMA Management","RemappingSupported",0x00010001, 1
+  HKR,"DMA Management","RemappingFlags",0x00010001, 1
+  ```
+  Because `[BMG_IAG_E20B_FWU_WNEXT.HW]` is an `.HW` section, `HKR` maps to `HKLM\SYSTEM\CurrentControlSet\Enum\PCI\VEN_8086&DEV_E20B...\Device Parameters\DMA Management` (owned exclusively by `NT AUTHORITY\SYSTEM`). Setting `Services\igfxnd\Parameters\DmaRemappingCompatible = 0` does **not** disable per-device IOMMU DMA Remapping on Windows 11 24H2!
+
+### Trap B: `pci.sys` Reads `D3ColdSupported` and `ASPMOptOut` from GUID Subkey `e5b3b5ac-9725-4f78-963f-03dfb1d828c7`
+Both `iigd_dch_d.inf` (`DEV_E20B`) and `memcntrl.inf` (`DEV_E2FF`, `DEV_E2F0`, `DEV_E2F1`) include `Needs = PciD3ColdSupported.Hw` from `C:\Windows\INF\pci.inf`.
+In `C:\Windows\INF\pci.inf` (lines 110–255), `pci.sys` does **not** read `Device Parameters\D3ColdSupported`; it reads the hardware GUID subkey:
+```ini
+[PciD3ColdSupported.Hw.AddReg]
+HKR,"e5b3b5ac-9725-4f78-963f-03dfb1d828c7","D3ColdSupported",0x00010001,1
+
+[PciD3ColdUnsupported.Hw.AddReg]
+HKR,"e5b3b5ac-9725-4f78-963f-03dfb1d828c7","D3ColdSupported",0x00010001,0
+
+[PciASPMOptOut.Hw.AddReg]
+HKR,"e5b3b5ac-9725-4f78-963f-03dfb1d828c7","ASPMOptOut",0x00010001,1
+
+[PciExtraSettleTimeRequired.Hw.AddReg]
+HKR,"e5b3b5ac-9725-4f78-963f-03dfb1d828c7","SettleTimeRequired",0x00010001,1
+
+[PciIgnoreErrorsDuringPLDR.Hw.AddReg]
+HKR,"e5b3b5ac-9725-4f78-963f-03dfb1d828c7","IgnoreErrorsDuringPLDR",0x00010001,1
+```
+
+### Trap C: `HdBusExt.inf` ("Intel(R) HD Graphics D3COLD") Forces `DEV_E2F7` into D3Cold
+`HdBusExt.inf` writes `PowerSettings\EnableD3Cold = 1` under `HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e97d-e325-11ce-bfc1-08002be10318}\0066` and `hdaudbus.inf` writes `Device Parameters\WDF\IdleInWorkingState = 1` and `WdfDirectedPowerTransitionEnable = 1` on `PCI\VEN_8086&DEV_E2F7`.
+
+---
+
+## 3. Millisecond Reconstruction of the `2026-11-01` Crash (`16:59:39` – `17:06:30`)
+
+On `2026-11-01`, VBS and Hyper-V were already disabled (`0`), yet the GPU still dropped into `Code 43` at `16:59:50.766` and froze across 3 consecutive boots. Cross-referencing `Microsoft-Windows-Kernel-PnP/Driver Watchdog`, `Microsoft-Windows-PCI/Operational`, `Microsoft-Windows-WerKernel/Operational`, `ArcBootGuard.log`, and `C:\ProgramData\Intel\IGS\Logs\App20261101.log` exposed the exact chain of events:
+
+### Boot 1 (`16:59:39` – `17:00:33`): `MOTUCoreUAC` 5,034ms PnP Stall $\rightarrow$ `dxgkrnl.sys` `STATUS_TIMEOUT` $\rightarrow$ `PresentMonAPI2.dll` Freeze
+- **`16:59:43.917` – `16:59:43.949` (`PCI/Operational`):** `PCI\VEN_8086&DEV_E20B` transitions from `UNINITIALIZED` to `STARTED`. `igfxnd.sys` begins enumerating child PnP devices (`VIDEO\INTC_HECI_2` $\rightarrow$ `GSCx64` / `TeeDriverGSCW8x64.sys`) while `IntelGFXFWupdateTool` probes GSC/OPROM firmware.
+- **`16:59:45.649` – `16:59:50.683` (`Kernel-PnP/Driver Watchdog Event ID 902 & 903`):** `USB\VID_07FD&PID_000B&MI_00` (`Service: MOTUCoreUAC`, MOTU USB Audio Interface) starts on the Windows Kernel PnP Device Start worker thread (`Thread ID 0x178`) and **blocks the global PnP Device Start thread for `5,034 milliseconds`**.
+- **`16:59:50.766` (+83 ms after `MOTUCoreUAC` releases Thread `0x178`):** Because `TdrDelay` / `TdrDdiDelay` was only `10s` and `DMA Management\RemappingSupported = 1` + `e5b3b5ac-9725-4f78-963f-03dfb1d828c7\D3ColdSupported = 1` were still active, `dxgkrnl.sys` logs `WerKernel Event ID 1001` (`BugcheckCode 0x1A8`, `Status: STATUS_TIMEOUT`, `WATCHDOG-20261101-1659.dmp`) and surprise-removes `PCI\VEN_8086&DEV_E20B` (`Kernel-PnP Event ID 1011`, `ConfigManagerErrorCode = 43`).
+- **`17:00:02.486` – `17:00:11.026` (`ArcBootGuard.log` & `WerKernel`):** `ArcBootGuard.ps1` v1.0 detects `ErrorCode = 43` and executes `pnputil.exe /restart-device` on `DEV_E20B` and `DEV_E2F0`. Each `pnputil` call triggers a kernel watchdog fault inside `ProcessID = 4` (`System`) at `17:00:03.067`, `17:00:05.444`, and `17:00:08.613` (`WATCHDOG-20261101-1700.dmp` / `1700_01.dmp` / `1700_02.dmp`).
+- **`17:00:27.235` (`Service20261101.log`):** Even though `IntelGraphicsSoftware` was removed from `HKLM\...\Run`, the Windows service **`intelgraphicssoftwareservice`** (`IntelGraphicsSoftware.Service.exe`) automatically launches `IntelGraphicsSoftware.exe --minimized` on user logon.
+- **`17:00:32.854` – `17:00:32.875` (`App20261101.log`):** `IntelGraphicsSoftware.exe` loads **`PresentMonAPI2.dll`** (`17:00:32.854`) and calls `ctlInit()` (`result=1073741825`) and `ctlEnumerateDevices()` (`result=1073741836`) against the broken `Code 43` GPU.
+- **`17:00:33`:** **The Windows kernel deadlocks solid.**
+
+### Boot 2 (`17:05:53`) & Boot 3 (`17:06:26`): `pnputil /restart-device` Kernel Deadlock in `System` (PID 4)
+- On Boot 2 (`17:05:53.878`) and Boot 3 (`17:06:26.710`), the PCIe switch is still latched in `Code 43` from the warm reset.
+- When `ArcBootGuard.ps1` v1.0 calls `pnputil.exe /restart-device` on `DEV_E20B`, **the kernel deadlocks mid-write**, leaving `141` null bytes (`\x00`) on Boot 2 and `259` null bytes (`\x00`) on Boot 3 inside `ArcBootGuard.log`!
+- This proves beyond doubt that **calling `pnputil /restart-device` or `/disable-device` on a `Code 43` Battlemage GPU deadlocks `dxgkrnl.sys` inside `System` (PID 4)**.

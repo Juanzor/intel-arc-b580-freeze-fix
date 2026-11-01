@@ -1,4 +1,4 @@
-# Intel Arc B580 / Battlemage Startup Freeze, Code 43 (Event ID 1011) & DDU Safe Mode Loop Fix
+# Intel Arc B580 / Battlemage Startup Freeze, Code 43 (Event ID 1011) & DDU Safe Mode Loop Fix (v2.0)
 
 > Forensic root-cause analysis and permanent automated fix for Intel Arc B580 (`PCI\VEN_8086&DEV_E20B`), B570, A770, and A750 GPUs freezing Windows 11 ~30-40 seconds after boot/login, entering `ConfigManagerErrorCode = 43` (`Kernel-PnP Event ID 1011`), and requiring Display Driver Uninstaller (DDU) in Safe Mode to recover.
 
@@ -7,29 +7,36 @@
 When a user reports that their **Intel Arc B580** (or Intel Arc GPU on Windows 11 23H2/24H2, particularly on AMD AM5 Ryzen 7000/9000 + B650/X670 or Intel platforms):
 1. Freezes Windows completely ~30–40 seconds after startup/login.
 2. Enters a permanent freeze loop on every warm reboot (Reset button) until the user boots into **Safe Mode and runs DDU**.
-3. Repeats this failure 5–15 days after every clean WHQL driver installation (`32.0.101.9030`, `32.0.101.9150`, etc.), even when **Resizable BAR** is enabled, **Fast Startup** is disabled, and **Memory Integrity (HVCI)** was turned off in the Windows Security GUI.
+3. Repeats this failure 5–15 days after every clean WHQL driver installation (`32.0.101.9030`, `32.0.101.9150`, etc.), even when **Resizable BAR** is enabled, **Fast Startup** is disabled, **Memory Integrity (HVCI)** is turned off, and even after setting `Services\igfxnd\Parameters\DmaRemappingCompatible = 0`.
 
-### Exact Two-Stage Root Cause:
-- **Stage 1 (Cold-Boot `Event ID 1011` / `Code 43`):**
-  - Intel's DCH INF (`iigd_dch_d.inf`, section `[DMAr_AddReg3]`) sets `HKLM\SYSTEM\CurrentControlSet\Services\igfxnd\Parameters\DmaRemappingCompatible = 3` (opting `igdkmdnd64.sys` into Kernel DMA Remapping / IOMMU isolation) and enables `D3ColdSupported = 1` on the Battlemage internal PCIe switch (`VEN_8086&DEV_E2FF` -> `DEV_E2F0` -> `DEV_E20B`).
-  - On Windows 11 24H2, turning off "Memory Integrity (HVCI)" in the GUI leaves `EnableVirtualizationBasedSecurity = 1` and `LsaCfgFlagsDefault = 2` (LSA Credential Guard `lsaiso.exe`) active, so `Hyper-V-Hypervisor` still initializes **IOMMU (`Event ID 129`)** on every boot.
-  - ~140–222 ms before `wininit.exe` starts `lsaiso.exe`, an IOMMU DMA remapping race condition causes `PCI\VEN_8086&DEV_E20B` to drop out with `Microsoft-Windows-Kernel-PnP Event ID 1011` (*"Device PCI\VEN_8086&DEV_E20B... has been surprise removed as it was reported to be failing"*), leaving the GPU in `ConfigManagerErrorCode = 43`. Windows is **not** frozen yet; it boots to the desktop using `BasicDisplay`.
-- **Stage 2 (The 35-Second Post-Login Kernel Deadlock):**
-  - ~35 seconds after login, Windows `Run` launches `"C:\Program Files\Intel\Intel Graphics Software\IntelGraphicsSoftware.exe" -s`, which spawns `IntelGraphicsSoftware.Overlay.exe` and connects to the `PresentMonSharedService` (`C:\Program Files\Intel\PresentMonSharedService\PresentMonService.exe` / `PresentMonAPI2.dll`).
-  - When `Overlay.exe` calls `ControlLib.dll` (`[Overlay ID:44] ctlEnumerateDevices, result=1073741836`) against `igdkmdnd64.sys` while the GPU is in `Code 43`, the Windows kernel deadlocks solid.
-  - Warm reboots (Reset button) do not cut PCIe slot power, so the card's PCIe switch remains latched in `Code 43` and freezes again 35 seconds after every reboot. DDU in Safe Mode only worked because Safe Mode blocks `Overlay.exe` and DDU's PnP teardown resets the PCIe switch.
+### Complete Two-Stage Root Cause (v1.0 + v2.0 Forensic Findings):
 
-### Permanent Solution (Included in This Repository):
-1. Set `HKLM\SYSTEM\CurrentControlSet\Services\igfxnd\Parameters\DmaRemappingCompatible = 0`.
-2. Completely disable VBS, Credential Guard (`lsaiso.exe`), and Hyper-V IOMMU (`EnableVirtualizationBasedSecurity = 0`, `LsaCfgFlags = 0`, `LsaCfgFlagsDefault = 0`, `HyperVVirtualizationBasedSecurityOptout = 1`, `bcdedit /set hypervisorlaunchtype off`, `bcdedit /set vsmlaunchtype Off`).
-3. Disable PCIe `D3Cold` (`HKLM\SYSTEM\CurrentControlSet\Control\PnP\Pci\Parameters\DisableD3Cold = 1` and `D3ColdSupported = 0` on all `VEN_8086&DEV_E2*` devices).
-4. Remove `IntelGraphicsSoftware` from `HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run`, disable `PresentMonSharedService` and `ESRV_SVC_QUEENCREEK`, and rename `IntelGraphicsSoftware.Overlay.exe` and `PresentMonService.exe` to `.disabled`.
-5. Install [`scripts/ArcBootGuard.ps1`](./scripts/ArcBootGuard.ps1) as a `SYSTEM` Scheduled Task (`AtStartup` + `AtLogOn`) to automatically re-apply these protections after future driver updates and auto-recover the PCIe switch via `pnputil /restart-device` if `ConfigManagerErrorCode != 0` ever occurs.
+#### Stage 1: Why the GPU Drops into `Code 43` (`Kernel-PnP Event ID 1011`) at Cold Boot
+1. **Windows 11 24H2 (`wNext`) Per-Device IOMMU DMA Remapping (`[DMAr_AddReg1]` in `iigd_dch_d.inf`):**
+   - On Windows 10 and Windows 11 22H2/23H2 (`[BMG_W11_IAG_E20B_FWU]`), `iigd_dch_d.inf` uses `[DMAr_AddReg3]` which writes `HKLM\SYSTEM\CurrentControlSet\Services\igfxnd\Parameters\DmaRemappingCompatible = 3`.
+   - On **Windows 11 24H2 Build 26100+ (`[BMG_IAG_E20B_FWU_WNEXT]`, line 2616)**, Intel switched to **`[DMAr_AddReg1]`** (lines 4246–4250), which writes **per-device** IOMMU DMA remapping flags directly into the `NT AUTHORITY\SYSTEM`-owned hardware instance key:
+     - `HKLM\SYSTEM\CurrentControlSet\Enum\PCI\VEN_8086&DEV_E20B...\Device Parameters\DMA Management\RemappingSupported = 1`
+     - `HKLM\SYSTEM\CurrentControlSet\Enum\PCI\VEN_8086&DEV_E20B...\Device Parameters\DMA Management\RemappingFlags = 1`
+   - Therefore, setting `Services\igfxnd\Parameters\DmaRemappingCompatible = 0` alone does **not** disable DMA remapping on Windows 11 24H2!
+2. **Hidden `pci.sys` GUID Subkey (`e5b3b5ac-9725-4f78-963f-03dfb1d828c7`) in `pci.inf` & `memcntrl.inf`:**
+   - Both `iigd_dch_d.inf` and `memcntrl.inf` (installed on the Battlemage internal PCIe switch `VEN_8086&DEV_E2FF`, `DEV_E2F0`, `DEV_E2F1`) include `Needs = PciD3ColdSupported.Hw` from `C:\Windows\INF\pci.inf`.
+   - `pci.sys` does **not** read `Device Parameters\D3ColdSupported` directly; it reads the `pci.sys` GUID subkey:
+     - `HKLM\SYSTEM\CurrentControlSet\Enum\PCI\<Device>\<Instance>\Device Parameters\e5b3b5ac-9725-4f78-963f-03dfb1d828c7\D3ColdSupported = 1`
+   - Furthermore, `HdBusExt.inf` ("Intel(R) HD Graphics D3COLD") enables `PowerSettings\EnableD3Cold = 1` and `WDF\IdleInWorkingState = 1` on `PCI\VEN_8086&DEV_E2F7` (the Battlemage High Definition Audio Controller sharing the card's internal PCIe switch).
+3. **Kernel-PnP Device Start Thread Contention (USB Audio `MOTUCoreUAC` 5,034ms Stall -> `dxgkrnl.sys` `STATUS_TIMEOUT`):**
+   - When `igfxnd.sys` starts on `DEV_E20B`, it enumerates child PnP devices (`VIDEO\INTC_HECI_2` -> `GSCx64` `TeeDriverGSCW8x64.sys` and `VIDEO\INTC_PMT`) and `IntelGFXFWupdateTool` probes GSC/OPROM firmware.
+   - If another driver (such as a USB Audio Interface like `MOTUCoreUAC`) blocks the global Windows Kernel-PnP Device Start worker thread for ~5,000 ms during boot (`Microsoft-Windows-Kernel-PnP/Driver Watchdog Event ID 902 / 903`), `dxgkrnl.sys` hits `STATUS_TIMEOUT` (`WATCHDOG-20261101-1659.dmp`) and surprise-removes `DEV_E20B` (`Event ID 1011`, `Code 43`).
 
-## Key Files
-- [README.md](./README.md): Full bilingual (English + Spanish) guide, troubleshooting history, and installation instructions.
-- [scripts/Install-IntelArcFix.ps1](./scripts/Install-IntelArcFix.ps1): Automated PowerShell installer for all Stage 1 & Stage 2 fixes.
-- [scripts/ArcBootGuard.ps1](./scripts/ArcBootGuard.ps1): Self-healing `SYSTEM` startup guard.
-- [scripts/Diagnose-IntelArc.ps1](./scripts/Diagnose-IntelArc.ps1): Read-only vulnerability and event log diagnostic script.
-- [docs/FORENSIC_TIMELINE_EN.md](./docs/FORENSIC_TIMELINE_EN.md): Millisecond-level forensic timeline (English).
-- [docs/FORENSIC_TIMELINE_ES.md](./docs/FORENSIC_TIMELINE_ES.md): Cronología forense detallada (Español).
+#### Stage 2: Why the Entire PC Freezes ~30–35 Seconds After Boot When in `Code 43`
+Even if `Code 43` occurs, Windows should simply run on `BasicDisplay` without freezing. Two mechanisms cause the total kernel deadlock:
+1. **`intelgraphicssoftwareservice` + `IntelGraphicsSoftware.exe` / `Overlay.exe` + `PresentMonAPI2.dll`:**
+   - Even if `IntelGraphicsSoftware` is removed from `HKLM\...\Run`, the Windows service `intelgraphicssoftwareservice` (`IntelGraphicsSoftware.Service.exe`) auto-spawns `IntelGraphicsSoftware.exe --minimized` on user logon, which loads `PresentMonAPI2.dll` and calls `ControlLib.dll` (`ctlInit()` / `ctlEnumerateDevices()`) against the broken `Code 43` GPU — deadlocking `igdkmdnd64.sys` ~33 seconds after boot.
+2. **CRITICAL TRAP: Calling `pnputil /restart-device` or `/disable-device` on a `Code 43` Battlemage GPU:**
+   - Attempting to auto-recover `PCI\VEN_8086&DEV_E20B` in software via `pnputil.exe /restart-device` or `/disable-device` while `igfxnd.sys` is bound in `Code 43` immediately deadlocks `dxgkrnl.sys` inside the `System` kernel process (`PID 4`). Never call `pnputil /restart-device` on a `Code 43` Arc GPU!
+
+### Complete Permanent Solution (v2.0 Included in This Repository):
+1. **Clean INF-Only WHQL Driver Installation:** Install `iigd_dch_d.inf` and its child INFs directly via `pnputil /add-driver` without installing the bloated `IntelGraphicsSoftware` / `PresentMon` background services, or disable `intelgraphicssoftwareservice`, `PresentMonSharedService`, `IntelGFXFWupdateTool` (`DisableGfxFWUpdate = 1`), and `IGSDSserviceDiscrete` and rename `PresentMonAPI2.dll` to `.disabled`.
+2. **Disable Windows 11 24H2 Per-Device IOMMU DMA Remapping (`NT AUTHORITY\SYSTEM`):** Set `Device Parameters\DMA Management\RemappingSupported = 0` and `RemappingFlags = 0` on all `VEN_8086` PCIe nodes, plus `DmaRemappingCompatible = 0` on `igfxnd`, `HDAudBus`, `GSCx64`, and `PmtChildDriver`.
+3. **Enforce `pci.sys` GUID Subkey (`e5b3b5ac-9725-4f78-963f-03dfb1d828c7`):** As `NT AUTHORITY\SYSTEM`, set `D3ColdSupported = 0`, `ASPMOptOut = 1`, `SettleTimeRequired = 1`, and `IgnoreErrorsDuringPLDR = 1` across all Battlemage PCIe nodes (`E2FF`, `E2F0`, `E2F1`, `E20B`, `E2F7`) and the parent PCIe Root Port (`VEN_1022&DEV_14DB`), plus `PowerSettings\EnableD3Cold = 0` and `WDF\IdleInWorkingState = 0` on `DEV_E2F7`.
+4. **Increase `dxgkrnl.sys` TDR Tolerance to 30s:** Set `TdrLevel = 3`, `TdrDelay = 30`, `TdrDdiDelay = 30`, `TdrLimitTime = 60`, `TdrLimitCount = 10`, and `DisableBadDriverCheck = 1` under `HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers`.
+5. **Run `ArcBootGuard.ps1` v2.0 as `NT AUTHORITY\SYSTEM` at Startup/Logon** (without `pnputil /restart-device`).

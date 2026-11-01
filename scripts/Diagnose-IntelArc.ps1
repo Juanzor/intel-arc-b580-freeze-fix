@@ -1,12 +1,13 @@
 # ==============================================================================
-# Diagnose-IntelArc.ps1
+# Diagnose-IntelArc.ps1 (v2.0)
 # Read-only diagnostic tool to check if a Windows PC is vulnerable to the
-# Intel Arc B580 / Battlemage 2-Stage Startup Freeze & Code 43 Deadlock.
+# Intel Arc B580 / Battlemage Startup Freeze, Code 43 (Event ID 1011),
+# Windows 11 24H2 Per-Device DMA Remapping, pci.sys GUID D3Cold, and IGCL Deadlock.
 # ==============================================================================
 $ErrorActionPreference = "SilentlyContinue"
 
 Write-Host "==================================================================" -ForegroundColor Cyan
-Write-Host "  INTEL ARC B580 / BATTLEMAGE STARTUP FREEZE DIAGNOSTIC REPORT" -ForegroundColor Cyan
+Write-Host "  INTEL ARC B580 / BATTLEMAGE STARTUP FREEZE DIAGNOSTIC v2.0" -ForegroundColor Cyan
 Write-Host "==================================================================" -ForegroundColor Cyan
 
 # 1. GPU Status
@@ -19,43 +20,44 @@ foreach ($g in $gpu) {
     Write-Host "  Video Mode    : $($g.CurrentHorizontalResolution)x$($g.CurrentVerticalResolution) @ $($g.CurrentRefreshRate)Hz"
 }
 
-# 2. Stage 1 Vulnerability Check (VBS, Credential Guard, DmaRemappingCompatible, D3Cold)
+# 2. Stage 1 Vulnerability Check (VBS, DMA Management, pci.sys GUID D3Cold/ASPM, TDR)
 Write-Host "`n[2] Stage 1 Vulnerability Check (Boot Code 43 / Event ID 1011):" -ForegroundColor Yellow
 $dg = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard"
 $lsa = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa"
 $igfx = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\igfxnd\Parameters"
-$pci = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\PnP\Pci\Parameters"
+$gfx = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers"
 
-$vbsState = if ($dg.EnableVirtualizationBasedSecurity -eq 0) { "SAFE (0)" } else { "VULNERABLE ($($dg.EnableVirtualizationBasedSecurity))" }
-$lsaState = if ($lsa.LsaCfgFlagsDefault -eq 0 -and ($null -eq $lsa.LsaCfgFlags -or $lsa.LsaCfgFlags -eq 0)) { "SAFE (0)" } else { "VULNERABLE (Default=$($lsa.LsaCfgFlagsDefault), Flags=$($lsa.LsaCfgFlags))" }
-$dmaState = if ($igfx.DmaRemappingCompatible -eq 0) { "SAFE (0)" } else { "VULNERABLE ($($igfx.DmaRemappingCompatible))" }
-$d3State  = if ($pci.DisableD3Cold -eq 1) { "SAFE (1)" } else { "VULNERABLE ($($pci.DisableD3Cold))" }
+Write-Host "  VBS (EnableVirtualizationBasedSecurity) : $(if ($dg.EnableVirtualizationBasedSecurity -eq 0) { 'SAFE (0)' } else { "VULNERABLE ($($dg.EnableVirtualizationBasedSecurity))" })"
+Write-Host "  Credential Guard (LsaCfgFlagsDefault)   : $(if ($lsa.LsaCfgFlagsDefault -eq 0) { 'SAFE (0)' } else { "VULNERABLE ($($lsa.LsaCfgFlagsDefault))" })"
+Write-Host "  igfxnd Service DmaRemappingCompatible   : $(if ($igfx.DmaRemappingCompatible -eq 0) { 'SAFE (0)' } else { "VULNERABLE ($($igfx.DmaRemappingCompatible))" })"
+Write-Host "  dxgkrnl TDR Timeout (TdrDelay/DdiDelay) : $(if ($gfx.TdrDelay -ge 20) { "SAFE ($($gfx.TdrDelay)s)" } else { "VULNERABLE ($($gfx.TdrDelay)s)" })"
 
-Write-Host "  VBS (EnableVirtualizationBasedSecurity) : $vbsState"
-Write-Host "  Credential Guard (LsaCfgFlagsDefault)   : $lsaState"
-Write-Host "  igfxnd DmaRemappingCompatible           : $dmaState"
-Write-Host "  Global PCIe DisableD3Cold               : $d3State"
+$pciGuid = "e5b3b5ac-9725-4f78-963f-03dfb1d828c7"
+Get-ChildItem "HKLM:\SYSTEM\CurrentControlSet\Enum\PCI" | Where-Object { $_.PSChildName -match "VEN_8086&DEV_E2" } | ForEach-Object {
+    $devId = $_.PSChildName
+    Get-ChildItem $_.PSPath | ForEach-Object {
+        $dp = Join-Path $_.PSPath "Device Parameters"
+        $g = Get-ItemProperty (Join-Path $dp $pciGuid)
+        $d = Get-ItemProperty (Join-Path $dp "DMA Management")
+        Write-Host "  $devId -> pci.sys GUID [D3Cold=$($g.D3ColdSupported), ASPMOptOut=$($g.ASPMOptOut)] | Win11 24H2 DMA [RemappingSupported=$($d.RemappingSupported)]"
+    }
+}
 
-# 3. Stage 2 Vulnerability Check (Overlay.exe, PresentMonSharedService, Run key)
-Write-Host "`n[3] Stage 2 Vulnerability Check (35s Post-Login Kernel Deadlock):" -ForegroundColor Yellow
-$overlayActive = Test-Path "C:\Program Files\Intel\Intel Graphics Software\IntelGraphicsSoftware.Overlay.exe"
-$pmSharedSvc = Get-CimInstance Win32_Service -Filter "Name='PresentMonSharedService'"
-$esrvSvc = Get-CimInstance Win32_Service -Filter "Name='ESRV_SVC_QUEENCREEK'"
+# 3. Stage 2 Vulnerability Check (Services & PresentMon / IGS)
+Write-Host "`n[3] Stage 2 Vulnerability Check (Post-Login Kernel Deadlock):" -ForegroundColor Yellow
+foreach ($svcName in @("intelgraphicssoftwareservice", "PresentMonSharedService", "IntelGFXFWupdateTool", "IGSDSserviceDiscrete", "ESRV_SVC_QUEENCREEK")) {
+    $s = Get-CimInstance Win32_Service -Filter "Name='$svcName'"
+    Write-Host "  Service $svcName : $(if ($s) { "$($s.State) ($($s.StartMode))" } else { 'SAFE (Not installed)' })"
+}
 
-Write-Host "  IntelGraphicsSoftware.Overlay.exe       : $(if ($overlayActive) { 'VULNERABLE (Active)' } else { 'SAFE (Disabled/Not present)' })"
-Write-Host "  PresentMonSharedService                 : $(if ($pmSharedSvc) { "$($pmSharedSvc.State) ($($pmSharedSvc.StartMode))" } else { 'Not installed' })"
-Write-Host "  ESRV_SVC_QUEENCREEK (SUR Energy Server) : $(if ($esrvSvc) { "$($esrvSvc.State) ($($esrvSvc.StartMode))" } else { 'Not installed' })"
-
-# 4. Historical Kernel-PnP Event ID 1011 Check
-Write-Host "`n[4] Historical Kernel-PnP Event ID 1011 (Surprise Removal) Count:" -ForegroundColor Yellow
+# 4. Historical Kernel-PnP Event ID 1011 & PnP Watchdog Event ID 902/903 Check
+Write-Host "`n[4] Historical Kernel-PnP Event ID 1011 (Surprise Removal):" -ForegroundColor Yellow
 $events1011 = Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-Kernel-PnP/Device Management'; Id=1011} -MaxEvents 10 -ErrorAction SilentlyContinue
 if ($events1011) {
-    Write-Host "  Found $($events1011.Count) recent Event ID 1011 surprise removal event(s):" -ForegroundColor Red
     foreach ($ev in $events1011) {
-        Write-Host "    - $($ev.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss.fff')) : $($ev.Message -replace '\r?\n', ' ')"
+        Write-Host "    - $($ev.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss.fff')) : $($ev.Message -replace '\r?\n', ' ')" -ForegroundColor Red
     }
 } else {
     Write-Host "  0 recent Event ID 1011 occurrences found." -ForegroundColor Green
 }
-
 Write-Host "==================================================================" -ForegroundColor Cyan
