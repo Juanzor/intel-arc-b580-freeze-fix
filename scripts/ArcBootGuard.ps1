@@ -1,6 +1,23 @@
 # ==============================================================================
-# Intel Arc B580 / Battlemage & Alchemist Self-Healing Boot Guard (ArcBootGuard.ps1)
+# Intel Arc B580 / Battlemage & Alchemist Boot Shield v2.0 (ArcBootGuard.ps1)
 # Runs as NT AUTHORITY\SYSTEM at Windows Startup and Logon via Scheduled Task.
+#
+# Forensic v2.0 Fixes (2026-11-01):
+# 1. Disables Windows 11 24H2 (wNext) per-device IOMMU DMA Remapping ([DMAr_AddReg1]:
+#    Device Parameters\DMA Management\RemappingSupported = 0 & RemappingFlags = 0)
+#    in addition to Services\igfxnd\Parameters\DmaRemappingCompatible = 0.
+# 2. Enforces pci.sys hardware GUID subkey (e5b3b5ac-9725-4f78-963f-03dfb1d828c7):
+#    D3ColdSupported = 0, ASPMOptOut = 1, SettleTimeRequired = 1, IgnoreErrorsDuringPLDR = 1
+#    on all Intel Arc PCIe Switch/GPU/Audio nodes (E2FF, E2F0, E2F1, E20B, E2F7) and
+#    parent AMD PCIe Root Port (VEN_1022&DEV_14DB), overriding pci.inf & memcntrl.inf.
+# 3. Overrides HdBusExt.inf ("Intel(R) HD Graphics D3COLD") EnableD3Cold = 0 and WDF
+#    IdleInWorkingState = 0 / WdfDirectedPowerTransitionEnable = 0 on DEV_E2F7.
+# 4. Enforces TdrDelay = 30 / TdrDdiDelay = 30 so USB Audio (MOTUCoreUAC) 5s PnP device
+#    start stalls at boot never cause dxgkrnl.sys STATUS_TIMEOUT (Event ID 1011).
+# 5. Disables IntelGFXFWupdateTool (DisableGfxFWUpdate = 1), intelgraphicssoftwareservice,
+#    PresentMonSharedService, and PresentMonAPI2.dll to prevent IGCL ctlInit() deadlocks.
+# 6. NEVER calls pnputil /restart-device or /disable-device on a Code 43 GPU (which
+#    deadlocks dxgkrnl.sys in System PID 4).
 # ==============================================================================
 $ErrorActionPreference = "SilentlyContinue"
 $LogDir = "C:\ProgramData\IntelArcGuard"
@@ -12,9 +29,12 @@ function Write-GuardLog([string]$msg) {
     "$ts - $msg" | Out-File -FilePath $LogFile -Append -Encoding UTF8
 }
 
-Write-GuardLog "=== ArcBootGuard triggered (Context: $env:USERNAME) ==="
+Write-GuardLog "=== ArcBootGuard v2.0 triggered (Context: $env:USERNAME) ==="
 
-# 1. Neutralize startup auto-run & deadlock triggers (Stage 2 Prevention)
+# ------------------------------------------------------------------------------
+# 1. Neutralize IGCL / PresentMon / Firmware Update services & startup processes
+#    (Prevents Stage 2 kernel freeze if GPU ever enters fallback state)
+# ------------------------------------------------------------------------------
 $runPaths = @(
     "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run",
     "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
@@ -29,34 +49,13 @@ foreach ($rp in $runPaths) {
     }
 }
 
-# Stop processes that trigger the IGCL ctlEnumerateDevices kernel deadlock on Code 43
-Get-Process -Name "IntelGraphicsSoftware.Overlay", "PresentMonService", "igfxShaderDistributionService", "esrv_svc", "SurSvc", "collector_service", "telemetry_agent" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-
-$igsDir = "C:\Program Files\Intel\Intel Graphics Software"
-if (Test-Path $igsDir) {
-    foreach ($exe in @("IntelGraphicsSoftware.Overlay.exe", "PresentMonService.exe")) {
-        $fullPath = Join-Path $igsDir $exe
-        if (Test-Path $fullPath) {
-            Rename-Item -Path $fullPath -NewName "$exe.disabled" -Force -ErrorAction SilentlyContinue
-            Write-GuardLog "Disabled background executable: $fullPath"
-        }
-    }
-}
-
-$pmSharedDir = "C:\Program Files\Intel\PresentMonSharedService"
-if (Test-Path $pmSharedDir) {
-    $pmExe = Join-Path $pmSharedDir "PresentMonService.exe"
-    if (Test-Path $pmExe) {
-        Rename-Item -Path $pmExe -NewName "PresentMonService.exe.disabled" -Force -ErrorAction SilentlyContinue
-        Write-GuardLog "Disabled PresentMonSharedService executable: $pmExe"
-    }
-}
-
-# Disable conflictive auxiliary & telemetry services (while keeping DSAService enabled for normal driver updates)
 $toxicServices = @(
+    "intelgraphicssoftwareservice",
     "PresentMonSharedService",
+    "PresentMonService",
     "IGSDSserviceDiscrete",
     "IntelGFXFWupdateTool",
+    "OneApp.IGCC.WinService",
     "PRI-Driver",
     "ESRV_SVC_QUEENCREEK",
     "USER_ESRV_SVC_QUEENCREEK",
@@ -73,89 +72,143 @@ foreach ($svc in $toxicServices) {
     }
 }
 
-# Keep DSAService & DSAUpdateService enabled (Delayed Auto-Start) so built-in driver updates in Intel Graphics Software work normally
-foreach ($dsaSvc in @("DSAService", "DSAUpdateService")) {
-    if (Get-Service -Name $dsaSvc -ErrorAction SilentlyContinue) {
-        sc.exe config $dsaSvc start= delayed-auto | Out-Null
-        Start-Service -Name $dsaSvc -ErrorAction SilentlyContinue
+# Disable boot-time GSC/OPROM firmware update probe in IntelGFXFWupdateTool
+if (Test-Path "HKLM:\SYSTEM\CurrentControlSet\Services\IntelGFXFWupdateTool") {
+    $fwParamKey = "HKLM:\SYSTEM\CurrentControlSet\Services\IntelGFXFWupdateTool\Parameters"
+    if (!(Test-Path $fwParamKey)) { New-Item -Path $fwParamKey -Force | Out-Null }
+    Set-ItemProperty -Path $fwParamKey -Name "DisableGfxFWUpdate" -Value 1 -Type DWord -Force
+}
+
+# Stop any running background processes that invoke ctlInit() / PresentMonAPI2.dll
+Get-Process -Name "IntelGraphicsSoftware*", "PresentMon*", "igfxShaderDistributionService", "IntelGFXFWupdateTool", "esrv_svc", "SurSvc", "collector_service", "telemetry_agent" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+
+# Neutralize PresentMon & IGS background binaries if installed
+$igsDir = "C:\Program Files\Intel\Intel Graphics Software"
+if (Test-Path $igsDir) {
+    foreach ($bin in @("IntelGraphicsSoftware.Service.exe", "IntelGraphicsSoftware.Overlay.exe", "PresentMonService.exe", "PresentMon_x64.exe", "PresentMonAPI2.dll", "ControlLib.dll")) {
+        $fullPath = Join-Path $igsDir $bin
+        if (Test-Path $fullPath) {
+            Rename-Item -Path $fullPath -NewName "$bin.disabled" -Force -ErrorAction SilentlyContinue
+            Write-GuardLog "Neutralized IGS binary: $fullPath"
+        }
     }
 }
 
-# Keep intelgraphicssoftwareservice on Manual (3) so it never races during boot
-if (Get-Service -Name "intelgraphicssoftwareservice" -ErrorAction SilentlyContinue) {
-    reg.exe add "HKLM\SYSTEM\CurrentControlSet\Services\intelgraphicssoftwareservice" /v Start /t REG_DWORD /d 3 /f | Out-Null
-}
-
-# 2. Enforce DmaRemappingCompatible = 0 on igfxnd (Stage 1 Prevention: overrides INF's 3)
-if (Test-Path "HKLM:\SYSTEM\CurrentControlSet\Services\igfxnd\Parameters") {
-    $curDma = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\igfxnd\Parameters" -Name "DmaRemappingCompatible" -ErrorAction SilentlyContinue).DmaRemappingCompatible
-    if ($curDma -ne 0) {
-        Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\igfxnd\Parameters" -Name "DmaRemappingCompatible" -Value 0 -Type DWord -Force
-        Write-GuardLog "Enforced igfxnd DmaRemappingCompatible = 0 (was $curDma)"
+$pmSharedDir = "C:\Program Files\Intel\PresentMonSharedService"
+if (Test-Path $pmSharedDir) {
+    Get-ChildItem -Path $pmSharedDir -Filter "*.exe" -ErrorAction SilentlyContinue | ForEach-Object {
+        Rename-Item -Path $_.FullName -NewName "$($_.Name).disabled" -Force -ErrorAction SilentlyContinue
+        Write-GuardLog "Neutralized PresentMonSharedService binary: $($_.FullName)"
     }
 }
 
-# 3. Enforce D3ColdSupported = 0 on all Intel Arc PCIe Switch & GPU nodes (E2*, 56*, 4F*)
+# ------------------------------------------------------------------------------
+# 2. Enforce DirectX Kernel Watchdog (dxgkrnl.sys TDR) 30s Timeout Tolerance
+#    (Prevents 5-second USB Audio / MOTUCoreUAC PnP device start stalls from
+#     causing STATUS_TIMEOUT / Event ID 1011 during boot)
+# ------------------------------------------------------------------------------
+$gfxDriversKey = "HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers"
+Set-ItemProperty -Path $gfxDriversKey -Name "TdrLevel" -Value 3 -Type DWord -Force
+Set-ItemProperty -Path $gfxDriversKey -Name "TdrDelay" -Value 30 -Type DWord -Force
+Set-ItemProperty -Path $gfxDriversKey -Name "TdrDdiDelay" -Value 30 -Type DWord -Force
+Set-ItemProperty -Path $gfxDriversKey -Name "TdrLimitTime" -Value 60 -Type DWord -Force
+Set-ItemProperty -Path $gfxDriversKey -Name "TdrLimitCount" -Value 10 -Type DWord -Force
+Set-ItemProperty -Path $gfxDriversKey -Name "DisableBadDriverCheck" -Value 1 -Type DWord -Force
+
+# ------------------------------------------------------------------------------
+# 3. Enforce IOMMU DMA Remapping Disable (Service + Windows 11 24H2 Per-Device)
+# ------------------------------------------------------------------------------
+foreach ($dmaSvc in @("igfxnd", "HDAudBus", "GSCx64", "PmtChildDriver")) {
+    $svcPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$dmaSvc"
+    if (Test-Path $svcPath) {
+        $paramPath = Join-Path $svcPath "Parameters"
+        if (!(Test-Path $paramPath)) { New-Item -Path $paramPath -Force | Out-Null }
+        Set-ItemProperty -Path $paramPath -Name "DmaRemappingCompatible" -Value 0 -Type DWord -Force
+    }
+}
+
+# ------------------------------------------------------------------------------
+# 4. Enforce pci.sys GUID Subkey (e5b3b5ac-9725-4f78-963f-03dfb1d828c7),
+#    Per-Device DMA Management, and WDF Power Settings on all Intel Arc PCIe
+#    nodes (E2*, 56*, 4F*) and parent AMD PCIe Root Port (VEN_1022&DEV_14DB)
+# ------------------------------------------------------------------------------
 reg.exe add "HKLM\SYSTEM\CurrentControlSet\Control\PnP\Pci\Parameters" /v DisableD3Cold /t REG_DWORD /d 1 /f | Out-Null
-$pciEnum = Get-ChildItem "HKLM:\SYSTEM\CurrentControlSet\Enum\PCI" -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match "VEN_8086&DEV_(E2|56|4F)" }
-foreach ($devKey in $pciEnum) {
+reg.exe add "HKLM\SYSTEM\CurrentControlSet\Control\Power" /v PlatformAoAcOverride /t REG_DWORD /d 0 /f | Out-Null
+
+$pciGuid = "e5b3b5ac-9725-4f78-963f-03dfb1d828c7"
+$pciTargets = Get-ChildItem "HKLM:\SYSTEM\CurrentControlSet\Enum\PCI" -ErrorAction SilentlyContinue | Where-Object {
+    $_.PSChildName -match "VEN_8086&DEV_(E2|56|4F)" -or $_.PSChildName -match "VEN_1022&DEV_14DB"
+}
+
+$patchedNodes = 0
+foreach ($devKey in $pciTargets) {
+    $isIntel = $devKey.PSChildName -match "VEN_8086"
     Get-ChildItem $devKey.PSPath -ErrorAction SilentlyContinue | ForEach-Object {
-        $devParams = Join-Path $_.PSPath "Device Parameters"
-        $wdfParams = Join-Path $devParams "WDF"
+        $instPath = $_.PSPath
+        $devParams = Join-Path $instPath "Device Parameters"
         if (Test-Path $devParams) {
-            Set-ItemProperty -Path $devParams -Name "D3ColdSupported" -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
-        }
-        if (Test-Path $wdfParams) {
-            Set-ItemProperty -Path $wdfParams -Name "D3ColdSupported" -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
+            # Direct Device Parameters D3ColdSupported
+            Set-ItemProperty -Path $devParams -Name "D3ColdSupported" -Value 0 -Type DWord -Force
+
+            # pci.sys Hardware GUID Subkey (overrides pci.inf & memcntrl.inf PciD3ColdSupported.Hw)
+            $guidKey = Join-Path $devParams $pciGuid
+            if (!(Test-Path $guidKey)) { New-Item -Path $guidKey -Force | Out-Null }
+            Set-ItemProperty -Path $guidKey -Name "D3ColdSupported" -Value 0 -Type DWord -Force
+            Set-ItemProperty -Path $guidKey -Name "ASPMOptOut" -Value 1 -Type DWord -Force
+            Set-ItemProperty -Path $guidKey -Name "SettleTimeRequired" -Value 1 -Type DWord -Force
+            Set-ItemProperty -Path $guidKey -Name "IgnoreErrorsDuringPLDR" -Value 1 -Type DWord -Force
+
+            if ($isIntel) {
+                # Windows 11 24H2 (wNext) Per-Device IOMMU DMA Remapping (overrides [DMAr_AddReg1])
+                $dmaKey = Join-Path $devParams "DMA Management"
+                if (!(Test-Path $dmaKey)) { New-Item -Path $dmaKey -Force | Out-Null }
+                Set-ItemProperty -Path $dmaKey -Name "RemappingSupported" -Value 0 -Type DWord -Force
+                Set-ItemProperty -Path $dmaKey -Name "RemappingFlags" -Value 0 -Type DWord -Force
+
+                # WDF Idle / Directed Power Transitions (overrides hdaudbus.inf on DEV_E2F7)
+                $wdfKey = Join-Path $devParams "WDF"
+                if (!(Test-Path $wdfKey)) { New-Item -Path $wdfKey -Force | Out-Null }
+                Set-ItemProperty -Path $wdfKey -Name "D3ColdSupported" -Value 0 -Type DWord -Force
+                Set-ItemProperty -Path $wdfKey -Name "IdleInWorkingState" -Value 0 -Type DWord -Force
+                Set-ItemProperty -Path $wdfKey -Name "WdfDirectedPowerTransitionEnable" -Value 0 -Type DWord -Force
+            }
+            $patchedNodes++
         }
     }
 }
+Write-GuardLog "Enforced pci.sys GUID ($pciGuid), DMA Management (0), and WDF (0) across $patchedNodes PCIe instances."
 
-# Enforce Display Class power settings
+# ------------------------------------------------------------------------------
+# 5. Override HdBusExt.inf ("Intel(R) HD Graphics D3COLD") in System Class
+#    & ULPS/D3Cold in Display Class
+# ------------------------------------------------------------------------------
+# System Class {4d36e97d-e325-11ce-bfc1-08002be10318} (hosts PCI\VEN_8086&DEV_E2F7 HD Audio Controller)
+Get-ChildItem "HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e97d-e325-11ce-bfc1-08002be10318}" -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match "^\d{4}$" } | ForEach-Object {
+    $clsPath = $_.PSPath
+    $props = Get-ItemProperty -Path $clsPath -ErrorAction SilentlyContinue
+    $pwrPath = Join-Path $clsPath "PowerSettings"
+    if (($props.MatchingDeviceId -match "8086") -or (Test-Path $pwrPath)) {
+        if (!(Test-Path $pwrPath)) { New-Item -Path $pwrPath -Force | Out-Null }
+        Set-ItemProperty -Path $pwrPath -Name "EnableD3Cold" -Value 0 -Type DWord -Force
+        Set-ItemProperty -Path $pwrPath -Name "ConservationIdleTime" -Value ([byte[]](0,0,0,0)) -Type Binary -Force
+        Set-ItemProperty -Path $pwrPath -Name "PerformanceIdleTime" -Value ([byte[]](0,0,0,0)) -Type Binary -Force
+    }
+}
+
+# Display Class {4d36e968-e325-11ce-bfc1-08002be10318} (hosts PCI\VEN_8086&DEV_E20B)
 Get-ChildItem "HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}" -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match "^\d{4}$" } | ForEach-Object {
     $p = $_.PSPath
-    Set-ItemProperty -Path $p -Name "EnableUlps" -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
-    Set-ItemProperty -Path $p -Name "DisableD3Cold" -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue
+    Set-ItemProperty -Path $p -Name "EnableUlps" -Value 0 -Type DWord -Force
+    Set-ItemProperty -Path $p -Name "DisableD3Cold" -Value 1 -Type DWord -Force
 }
 
-# 4. Check Intel Arc GPU Health & Auto-Heal Code 43 / Event 1011 Surprise Removal
+# ------------------------------------------------------------------------------
+# 6. Passive Health Check (NEVER call pnputil /restart-device on Code 43!)
+# ------------------------------------------------------------------------------
 $gpu = Get-CimInstance Win32_PnPEntity -Filter "DeviceID LIKE 'PCI\\VEN_8086&DEV_E20B%' OR DeviceID LIKE 'PCI\\VEN_8086&DEV_E20%' OR DeviceID LIKE 'PCI\\VEN_8086&DEV_56A%'" -ErrorAction SilentlyContinue | Select-Object -First 1
 if ($null -eq $gpu -or $gpu.ConfigManagerErrorCode -ne 0 -or $gpu.Status -ne "OK") {
     $errCode = if ($gpu) { $gpu.ConfigManagerErrorCode } else { "MISSING" }
-    Write-GuardLog "WARNING: Intel Arc GPU reported unhealthy state (ErrorCode=$errCode, Status=$($gpu.Status)). Initiating automatic PCIe recovery!"
-
-    Stop-Service -Name "intelgraphicssoftwareservice" -Force -ErrorAction SilentlyContinue
-    Get-Process -Name "IntelGraphicsSoftware*" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-
-    if ($gpu -and $gpu.DeviceID) {
-        Write-GuardLog "Restarting GPU device $($gpu.DeviceID)..."
-        pnputil.exe /restart-device "$($gpu.DeviceID)" | Out-Null
-        Start-Sleep -Seconds 2
-    }
-
-    $gpu = Get-CimInstance Win32_PnPEntity -Filter "DeviceID LIKE 'PCI\\VEN_8086&DEV_E20B%' OR DeviceID LIKE 'PCI\\VEN_8086&DEV_E20%' OR DeviceID LIKE 'PCI\\VEN_8086&DEV_56A%'" -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($null -eq $gpu -or $gpu.ConfigManagerErrorCode -ne 0) {
-        $switchPort = Get-CimInstance Win32_PnPEntity -Filter "DeviceID LIKE 'PCI\\VEN_8086&DEV_E2F0%' OR DeviceID LIKE 'PCI\\VEN_8086&DEV_4F8%'" -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($switchPort -and $switchPort.DeviceID) {
-            Write-GuardLog "Restarting parent PCIe Switch Port $($switchPort.DeviceID)..."
-            pnputil.exe /restart-device "$($switchPort.DeviceID)" | Out-Null
-            Start-Sleep -Seconds 2
-        }
-        if ($gpu -and $gpu.DeviceID) {
-            Write-GuardLog "Cycling disable/enable on GPU $($gpu.DeviceID)..."
-            pnputil.exe /disable-device "$($gpu.DeviceID)" | Out-Null
-            Start-Sleep -Seconds 1
-            pnputil.exe /enable-device "$($gpu.DeviceID)" | Out-Null
-            Start-Sleep -Seconds 2
-        }
-        pnputil.exe /scan-devices | Out-Null
-    }
-
-    $gpuAfter = Get-CimInstance Win32_PnPEntity -Filter "DeviceID LIKE 'PCI\\VEN_8086&DEV_E20B%' OR DeviceID LIKE 'PCI\\VEN_8086&DEV_E20%' OR DeviceID LIKE 'PCI\\VEN_8086&DEV_56A%'" -ErrorAction SilentlyContinue | Select-Object -First 1
-    Write-GuardLog "Post-recovery GPU state: Name=$($gpuAfter.Name), ErrorCode=$($gpuAfter.ConfigManagerErrorCode), Status=$($gpuAfter.Status)"
+    Write-GuardLog "WARNING: Intel Arc GPU reported ErrorCode=$errCode, Status=$($gpu.Status). Keeping user-mode IGCL/PresentMon blocked and avoiding pnputil /restart-device to prevent dxgkrnl.sys deadlock."
 } else {
     Write-GuardLog "Intel Arc GPU is healthy (Name=$($gpu.Name), ErrorCode=0, Status=OK)."
-    if (Get-Service -Name "intelgraphicssoftwareservice" -ErrorAction SilentlyContinue) {
-        Start-Service -Name "intelgraphicssoftwareservice" -ErrorAction SilentlyContinue
-    }
 }
